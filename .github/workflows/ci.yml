@@ -1,0 +1,35 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: 自检（六条负例必须能红）
+        run: node audit.mjs --self-test
+      - name: 演示独立核验（期望值由算式推出，不抄程序输出）
+        run: node examples/verify-demo.mjs
+      - name: CLI 在演示数据上必须返回 1（有异常）
+        run: |
+          set +e
+          node audit.mjs --input examples/演示-结算单.csv --declared-rate 0.06 | tee cli-out.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exit=$code"
+          test "$code" -eq 1
+      - name: 缺列必须返回 2 且不出报告
+        run: |
+          printf 'order_id,gmv\nA1,100\n' > broken.csv
+          set +e
+          node audit.mjs --input broken.csv
+          code=$?
+          set -e
+          test "$code" -eq 2
