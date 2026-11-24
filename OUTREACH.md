@@ -4,7 +4,11 @@
 
 | 日期 | 社区/平台 | 形式 | 链接 | 反馈 |
 |---|---|---|---|---|
-| — | （待发布） | — | — | — |
+| 2026-11-24 | GitHub | 仓库公开（zjdyzww/audit-kit） | https://github.com/zjdyzww/audit-kit | 匿名 API 200，确认公开可读 |
+| 2026-11-24 | GitHub | Release v0.1.0 + 7 个 topics | https://github.com/zjdyzww/audit-kit/releases/tag/v0.1.0 | 待观察 |
+
+> 说明：向他人仓库（lilishop / shopxo）开 issue 属于**以 yushanhe 实名身份**对外发言，
+> 未获明确同意前不擅自执行。
 
 ## 目标投放点（按可获得性排序）
 
@@ -19,5 +23,5 @@
 - [x] `--self-test` 全绿，五条负例能红
 - [x] `examples/verify-demo.mjs` 独立核验通过（期望值算式推出）
 - [x] README 有「一条命令看效果」
-- [ ] 仓库公开（需账号）
+- [x] 仓库公开（zjdyzww/audit-kit，2026-11-24）
 - [ ] 至少 1 条陌生人反馈
