@@ -33,6 +33,7 @@
 
 import { readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { readXlsx, XlsxError } from './xlsx-lite.mjs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -77,6 +78,29 @@ function parseCsv(text) {
 }
 
 /**
+ * 把日期归一成 YYYY-MM-DD；xlsx 里的日期是 Excel 序列号，需换算。
+ * 序列号合法区间取 20000–80000（约 1954–2119 年），区间外按原样保留。
+ * @param {string} text 原始值
+ * @param {number} lineNumber 行号（用于报错定位）
+ * @returns {string}
+ */
+function normalizeDate(text, lineNumber) {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text
+  if (/^\d+(\.\d+)?$/.test(text)) {
+    const serial = Number(text)
+    if (serial >= 20000 && serial <= 80000) {
+      const millis = Date.UTC(1899, 11, 30) + Math.round(serial) * 86400000
+      return new Date(millis).toISOString().slice(0, 10)
+    }
+  }
+  if (/^\d{4}[/.]\d{1,2}[/.]\d{1,2}$/.test(text)) {
+    const [year, month, day] = text.split(/[/.]/)
+    return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+  }
+  throw new InputError(`第 ${lineNumber} 行 settle_date 无法解析: ${JSON.stringify(text)}`)
+}
+
+/**
  * 把原始行映射成标准账目记录。
  * @param {{headers: string[], rows: string[][]}} table
  * @param {Record<string,string>|null} mapping 标准字段 → 平台列名；null 表示列名已是标准名
@@ -97,7 +121,8 @@ function mapRows(table, mapping = null) {
       const raw = cells[position[name]] ?? ''
       if (name === 'order_id' || name === 'settle_date') {
         if (String(raw).trim() === '') throw new InputError(`第 ${rowIndex + 2} 行 ${name} 为空`)
-        record[name] = String(raw).trim()
+        const text = String(raw).trim()
+        record[name] = name === 'settle_date' ? normalizeDate(text, rowIndex + 2) : text
       } else {
         const value = Number(String(raw).replace(/,/g, '').trim())
         if (!Number.isFinite(value)) {
@@ -245,11 +270,34 @@ function runSelfTest() {
   if (suggestion.unresolved.length > 0) failures.push(`映射草案未能识别: ${suggestion.unresolved.join(', ')}`)
   if (Object.keys(suggestion.mapping).length !== REQUIRED.length) failures.push(`映射草案应覆盖 ${REQUIRED.length} 个字段，实际 ${Object.keys(suggestion.mapping).length}`)
 
+  // xlsx 正例：读 openpyxl 生成的 fixture（跨实现验证，不是自己读自己）
+  try {
+    const fixture = new URL('./examples/示例-结算单.xlsx', import.meta.url)
+    const table = readXlsx(readFileSync(fixture))
+    const mapping = suggestMapping(table.headers)
+    if (mapping.unresolved.length > 0) failures.push(`xlsx 映射草案未识别: ${mapping.unresolved.join(', ')}`)
+    const xlsxResult = audit(mapRows(table, mapping.mapping), 0.06)
+    if (xlsxResult.totals.gmv !== 3500) failures.push(`xlsx 正例 GMV 应为 3500，实际 ${xlsxResult.totals.gmv}`)
+    if (Math.abs(xlsxResult.effectiveRate - 290.5 / 3500) > 1e-9) failures.push(`xlsx 正例费率算错: ${xlsxResult.effectiveRate}`)
+    const dates = mapRows(table, mapping.mapping).map((row) => row.settle_date)
+    if (dates[0] !== '2026-01-05') failures.push(`xlsx 日期未从序列号归一: ${dates[0]}`)
+  } catch (error) {
+    failures.push(`xlsx 正例抛异常: ${error.message}`)
+  }
+
+  // xlsx 负例：不是 zip 的文件必须抛 XlsxError（不能返回空表）
+  try {
+    readXlsx(Buffer.from('这不是一个 xlsx'))
+    failures.push('xlsx 负例失败：坏文件被接受')
+  } catch (error) {
+    if (!(error instanceof XlsxError)) failures.push('xlsx 负例抛出的不是 XlsxError')
+  }
+
   if (failures.length > 0) {
     for (const item of failures) console.error(`SELFTEST FAIL: ${item}`)
     return 3
   }
-  console.log('SELFTEST PASS: 正例(标准列+中文映射)汇总正确；缺列/非数字/佣金超额/到账不符/重复单号/映射指向不存在列 六条负例全部拦下')
+  console.log('SELFTEST PASS: 正例(标准列/中文映射/真实 xlsx)全部正确；六条负例(缺列/非数字/佣金超额/到账不符/重复单号/映射列不存在)与 xlsx 坏文件负例均被拦下')
   return 0
 }
 
@@ -289,8 +337,9 @@ function main(argv) {
     return 2
   }
   try {
-    const text = readFileSync(input, 'utf8')
-    const table = parseCsv(text)
+    const raw = readFileSync(input)
+    const isXlsx = /\.xlsx$/i.test(input)
+    const table = isXlsx ? readXlsx(raw) : parseCsv(raw.toString('utf8'))
     if (argv.includes('--emit-mapping')) {
       const { mapping, unresolved } = suggestMapping(table.headers)
       console.log(JSON.stringify(mapping, null, 2))
@@ -330,7 +379,7 @@ function main(argv) {
     }
     return anomalies.length > 0 ? 1 : 0
   } catch (error) {
-    if (error instanceof InputError) {
+    if (error instanceof InputError || error instanceof XlsxError) {
       console.error(`输入错误: ${error.message}`)
       return 2
     }
