@@ -15,7 +15,7 @@
 | 格式 | v0 支持 | 说明 |
 |---|---|---|
 | CSV（UTF-8，允许 BOM） | ✅ | 首行表头，逗号分隔 |
-| XLSX | ❌（v1） | v0 明确拒绝并提示先导出 CSV，**不做静默降级** |
+| XLSX | ✅ | 零依赖内置解析（Node 自带 zlib 解 zip + 读 XML），只读第一个工作表 |
 
 ### 2.2 标准账目模型（canonical）
 
@@ -24,7 +24,7 @@
 | 字段 | 类型 | 含义 |
 |---|---|---|
 | `order_id` | string | 订单号（去重用） |
-| `settle_date` | date | 结算日期 `YYYY-MM-DD` |
+| `settle_date` | date | 结算日期 `YYYY-MM-DD`；xlsx 的 Excel 序列号（20000–80000）自动换算 |
 | `gmv` | number ≥0 | 该笔交易额（含运费、不含平台补贴） |
 | `commission` | number ≥0 | 平台佣金/技术服务费 |
 | `service_fee` | number ≥0 | 其他平台费用（推广、履约、包材等），无则填 0 |
