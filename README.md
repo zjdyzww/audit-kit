@@ -1,5 +1,7 @@
 # 抽成审计器（v0）
 
+![ci](https://github.com/zjdyzww/audit-kit/actions/workflows/ci.yml/badge.svg)
+
 **你的店，被平台抽走了多少？** 把这个数字算出来。
 
 导入平台结算单，它告诉你：实际费率是多少、按公示费率应抽多少、差额多少、有没有重复扣费。
