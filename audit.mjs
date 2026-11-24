@@ -8,11 +8,14 @@
  * @tier Tier1-delivery
  *
  * @skill parseCsv — 解析 CSV（容忍 BOM、引号、空行），返回 {headers, rows}
- * @skill mapRows — 按适配器把平台列名映射到标准账目模型；缺列即抛 InputError
+ * @skill mapRows — 按映射把平台列名映射到标准账目模型；缺列即抛 InputError
+ * @skill suggestMapping — 从实际表头猜一份映射草案（只猜名字，不改数据）
  * @skill audit — 汇总 GMV/佣金/服务费/退款/到账，算有效费率、应抽额、差额、异常
- * @skill runSelfTest — 正例 + 四条负例，真实退出码
+ * @skill runSelfTest — 正例 + 六条负例（含映射错误），真实退出码
  *
- * @rule missing_field_is_fatal P0 — 必需列缺失 ⇒ InputError，exit 2，不产出半份报告
+ * @rule missing_field_is_fatal P0 — 必需列缺失（映射后仍缺）⇒ InputError，exit 2，不产出半份报告
+ *   @enforced-by audit.mjs:--self-test
+ * @rule mapping_must_resolve P0 — --mapping 指向的列名必须在 CSV 里存在，否则 exit 2 并列出实际列名
  *   @enforced-by audit.mjs:--self-test
  * @rule must_exist_and_finite P0 — 金额必须是有限数且非负；解析失败指出行列与原始值 ⇒ exit 2
  *   @enforced-by audit.mjs:--self-test
@@ -76,15 +79,18 @@ function parseCsv(text) {
 /**
  * 把原始行映射成标准账目记录。
  * @param {{headers: string[], rows: string[][]}} table
+ * @param {Record<string,string>|null} mapping 标准字段 → 平台列名；null 表示列名已是标准名
  * @returns {Array<Record<string, string|number>>}
  */
-function mapRows(table) {
+function mapRows(table, mapping = null) {
   const present = new Set(table.headers)
-  const missing = REQUIRED.filter((name) => !present.has(name))
+  const resolve = (name) => (mapping && mapping[name] ? mapping[name] : name)
+  const missing = REQUIRED.filter((name) => !present.has(resolve(name)))
   if (missing.length > 0) {
-    throw new InputError(`缺少必需列: ${missing.join(', ')}；实际列: ${table.headers.join(', ')}`)
+    const detail = missing.map((name) => (mapping && mapping[name] ? `${name}←「${mapping[name]}」` : name))
+    throw new InputError(`缺少必需列: ${detail.join(', ')}；实际列: ${table.headers.join(', ')}`)
   }
-  const position = Object.fromEntries(REQUIRED.map((name) => [name, table.headers.indexOf(name)]))
+  const position = Object.fromEntries(REQUIRED.map((name) => [name, table.headers.indexOf(resolve(name))]))
   return table.rows.map((cells, rowIndex) => {
     const record = {}
     for (const name of REQUIRED) {
@@ -148,7 +154,34 @@ function money(value) {
 }
 
 /**
- * 自检：正例 + 四条负例。
+ * 从实际表头猜一份映射草案。只做名字匹配，不读数据、不猜测语义之外的变换。
+ * @param {string[]} headers CSV 表头
+ * @returns {{mapping: Record<string,string>, unresolved: string[]}}
+ */
+function suggestMapping(headers) {
+  const aliases = {
+    order_id: ['order_id', '订单号', '订单编号', '订单id', '交易单号', '子订单号'],
+    settle_date: ['settle_date', '结算日期', '结算时间', '入账日期', '账期'],
+    gmv: ['gmv', '交易额', '商品金额', '订单金额', '营业额', '成交金额'],
+    commission: ['commission', '佣金', '平台服务费', '技术服务费', '抽成'],
+    service_fee: ['service_fee', '服务费', '其他费用', '推广费', '履约服务费'],
+    refund: ['refund', '退款', '退款金额', '退货金额'],
+    payout: ['payout', '到账', '实收', '结算金额', '应结金额', '实际到账'],
+  }
+  const normalized = headers.map((header) => String(header).replace(/\s/g, '').toLowerCase())
+  const mapping = {}
+  const unresolved = []
+  for (const [field, candidates] of Object.entries(aliases)) {
+    const hit = candidates.find((candidate) => normalized.includes(candidate.toLowerCase()))
+    if (hit) mapping[field] = headers[normalized.indexOf(hit.toLowerCase())]
+    else if (normalized.includes(field)) mapping[field] = headers[normalized.indexOf(field)]
+    else unresolved.push(field)
+  }
+  return { mapping, unresolved }
+}
+
+/**
+ * 自检：正例 + 六条负例。
  * @returns {number} 0 通过 / 3 失败
  */
 function runSelfTest() {
@@ -192,11 +225,31 @@ function runSelfTest() {
   const bad3 = audit(mapRows(parseCsv(`${header}\nA1,2026-01-05,1000,50,10,0,940\nA1,2026-01-06,1000,50,10,0,940`)), null)
   if (!bad3.anomalies.some((item) => item.code === 'DUPLICATE_ORDER')) failures.push('负例5 失败：未检出 重复订单号')
 
+  // 正例 2：列名是中文，靠映射跑通
+  const zhHeader = '订单号,结算日期,商品金额,佣金,服务费,退款,实际到账'
+  const zhMapping = { order_id: '订单号', settle_date: '结算日期', gmv: '商品金额', commission: '佣金', service_fee: '服务费', refund: '退款', payout: '实际到账' }
+  const zhResult = audit(mapRows(parseCsv(`${zhHeader}\nB1,2026-02-01,1000,60,0,0,940`), zhMapping), 0.06)
+  if (zhResult.totals.gmv !== 1000) failures.push(`映射正例 GMV 应为 1000，实际 ${zhResult.totals.gmv}`)
+  if (Math.abs(zhResult.effectiveRate - 0.06) > 1e-9) failures.push(`映射正例 费率应为 0.06，实际 ${zhResult.effectiveRate}`)
+
+  // 负例 6：映射指向不存在的列 ⇒ InputError
+  try {
+    mapRows(parseCsv(`${header}\nA1,2026-01-05,1000,50,10,0,940`), { gmv: '不存在的列' })
+    failures.push('负例6 失败：映射指向不存在列却未报错')
+  } catch (error) {
+    if (!(error instanceof InputError)) failures.push('负例6 抛出的不是 InputError')
+  }
+
+  // mapping 草案：中文表头应能认出大部分字段
+  const suggestion = suggestMapping(zhHeader.split(','))
+  if (suggestion.unresolved.length > 0) failures.push(`映射草案未能识别: ${suggestion.unresolved.join(', ')}`)
+  if (Object.keys(suggestion.mapping).length !== REQUIRED.length) failures.push(`映射草案应覆盖 ${REQUIRED.length} 个字段，实际 ${Object.keys(suggestion.mapping).length}`)
+
   if (failures.length > 0) {
     for (const item of failures) console.error(`SELFTEST FAIL: ${item}`)
     return 3
   }
-  console.log('SELFTEST PASS: 正例汇总正确；缺列/非数字/佣金超额/到账不符/重复单号 五条负例全部拦下')
+  console.log('SELFTEST PASS: 正例(标准列+中文映射)汇总正确；缺列/非数字/佣金超额/到账不符/重复单号/映射指向不存在列 六条负例全部拦下')
   return 0
 }
 
@@ -206,7 +259,15 @@ function runSelfTest() {
  * @returns {number} 退出码 0/1/2/3
  */
 function main(argv) {
-  if (argv.includes('--self-test')) return runSelfTest()
+  if (argv.includes('--self-test')) {
+    // 自检内部抛出的任何异常都必须归约为 exit 3，不能崩成未捕获异常（否则退出码语义失真）
+    try {
+      return runSelfTest()
+    } catch (error) {
+      console.error(`SELFTEST FAIL: 自检过程抛出异常 — ${error.message}`)
+      return 3
+    }
+  }
   const option = (name, fallback = null) => {
     const index = argv.indexOf(`--${name}`)
     return index >= 0 && argv[index + 1] ? argv[index + 1] : fallback
@@ -229,7 +290,28 @@ function main(argv) {
   }
   try {
     const text = readFileSync(input, 'utf8')
-    const result = audit(mapRows(parseCsv(text)), declaredRate)
+    const table = parseCsv(text)
+    if (argv.includes('--emit-mapping')) {
+      const { mapping, unresolved } = suggestMapping(table.headers)
+      console.log(JSON.stringify(mapping, null, 2))
+      if (unresolved.length > 0) {
+        console.error(`未能自动识别: ${unresolved.join(', ')}；请手工补全后再用 --mapping 传入`)
+        console.error(`实际列: ${table.headers.join(', ')}`)
+        return 1
+      }
+      return 0
+    }
+    const mappingPath = option('mapping')
+    let mapping = null
+    if (mappingPath) {
+      try {
+        mapping = JSON.parse(readFileSync(mappingPath, 'utf8'))
+      } catch (error) {
+        console.error(`映射文件无法解析: ${mappingPath} (${error.message})`)
+        return 2
+      }
+    }
+    const result = audit(mapRows(table, mapping), declaredRate)
     const { totals, effectiveRate, expectedCommission, delta, anomalies } = result
     console.log(`实际抽成      ${money(totals.commission + totals.serviceFee)}   费率 ${(effectiveRate * 100).toFixed(2)}%`)
     console.log(`GMV           ${money(totals.gmv)}`)

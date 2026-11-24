@@ -42,6 +42,20 @@ node audit.mjs --input examples/演示-结算单.csv --declared-rate 0.06
 期望值由 `examples/verify-demo.mjs` 按算式独立推出，**不是抄程序输出**；
 两者不一致就 `DEMO FAIL`。这是防止「自己验自己」的循环论证。
 
+## 用你自己的列名（不需要等适配器）
+
+平台导出的列名千奇百怪，但**不需要改你的文件**：
+
+```sh
+# 1) 先让它猜一份映射草案
+node audit.mjs --input 你的结算单.csv --emit-mapping > map.json
+
+# 2) 打开 map.json 核对/修正列名，然后执行
+node audit.mjs --input 你的结算单.csv --mapping map.json --declared-rate 0.06
+```
+
+草案只做表头名字匹配，**不读你的数据**。映射指错列会直接报错并列出现有列名，不会算出一个看着像真的错数。
+
 ## 输入格式
 
 CSV（UTF-8，可带 BOM），必需列：
