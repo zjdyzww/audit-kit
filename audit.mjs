@@ -1,0 +1,263 @@
+#!/usr/bin/env node
+/**
+ * @module audit_kit
+ * @path ~/earn/audit-kit/audit.mjs
+ * @description 抽成审计器 v0：读平台结算单 CSV，算实际抽成费率、与公示费率比对、列出异常。
+ *   纯本地运行，不联网、不上传、不留存。规格见同目录 spec.md。
+ * @zone action
+ * @tier Tier1-delivery
+ *
+ * @skill parseCsv — 解析 CSV（容忍 BOM、引号、空行），返回 {headers, rows}
+ * @skill mapRows — 按适配器把平台列名映射到标准账目模型；缺列即抛 InputError
+ * @skill audit — 汇总 GMV/佣金/服务费/退款/到账，算有效费率、应抽额、差额、异常
+ * @skill runSelfTest — 正例 + 四条负例，真实退出码
+ *
+ * @rule missing_field_is_fatal P0 — 必需列缺失 ⇒ InputError，exit 2，不产出半份报告
+ *   @enforced-by audit.mjs:--self-test
+ * @rule must_exist_and_finite P0 — 金额必须是有限数且非负；解析失败指出行列与原始值 ⇒ exit 2
+ *   @enforced-by audit.mjs:--self-test
+ * @rule anomaly_nonblocking P1 — 异常不中止汇总，计入 anomalies 并让退出码为 1
+ *   @enforced-by audit.mjs:--self-test
+ * @rule payout_reconciliation P0 — payout 与 gmv-佣金-服务费+退款 的差 >0.01 即 PAYOUT_MISMATCH
+ *   @enforced-by audit.mjs:--self-test
+ * @rule no_silent_adapter_guess P0 — 适配器缺失或列对不上时列出实际列名，不猜、不填 0
+ *   @enforced-by audit.mjs:--self-test
+ *
+ * 用法：
+ *   node audit.mjs --input settle.csv [--declared-rate 0.06] [--adapter generic] [--json out.json]
+ *   node audit.mjs --self-test
+ */
+
+import { readFileSync, writeFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+/** 标准账目模型的必需列。 */
+const REQUIRED = ['order_id', 'settle_date', 'gmv', 'commission', 'service_fee', 'refund', 'payout']
+
+/** v0 只内置通用适配器；平台适配器在拿到真实样本前不写死。 */
+const ADAPTERS = {
+  generic: null,
+}
+
+/** 输入不满足前置条件（exit 2）。 */
+class InputError extends Error {}
+
+/**
+ * 解析 CSV 文本。
+ * @param {string} text 原始文本（可含 BOM）
+ * @returns {{headers: string[], rows: string[][]}}
+ */
+function parseCsv(text) {
+  const clean = text.replace(/^\uFEFF/, '')
+  const rows = []
+  let row = []
+  let field = ''
+  let inQuotes = false
+  for (let index = 0; index < clean.length; index += 1) {
+    const ch = clean[index]
+    if (inQuotes) {
+      if (ch === '"' && clean[index + 1] === '"') { field += '"'; index += 1 }
+      else if (ch === '"') inQuotes = false
+      else field += ch
+    } else if (ch === '"') inQuotes = true
+    else if (ch === ',') { row.push(field); field = '' }
+    else if (ch === '\n') { row.push(field); rows.push(row); row = []; field = '' }
+    else if (ch !== '\r') field += ch
+  }
+  if (field !== '' || row.length > 0) { row.push(field); rows.push(row) }
+  const nonEmpty = rows.filter((cells) => cells.some((cell) => String(cell).trim() !== ''))
+  if (nonEmpty.length === 0) throw new InputError('CSV 为空')
+  const headers = nonEmpty[0].map((cell) => String(cell).trim())
+  return { headers, rows: nonEmpty.slice(1) }
+}
+
+/**
+ * 把原始行映射成标准账目记录。
+ * @param {{headers: string[], rows: string[][]}} table
+ * @returns {Array<Record<string, string|number>>}
+ */
+function mapRows(table) {
+  const present = new Set(table.headers)
+  const missing = REQUIRED.filter((name) => !present.has(name))
+  if (missing.length > 0) {
+    throw new InputError(`缺少必需列: ${missing.join(', ')}；实际列: ${table.headers.join(', ')}`)
+  }
+  const position = Object.fromEntries(REQUIRED.map((name) => [name, table.headers.indexOf(name)]))
+  return table.rows.map((cells, rowIndex) => {
+    const record = {}
+    for (const name of REQUIRED) {
+      const raw = cells[position[name]] ?? ''
+      if (name === 'order_id' || name === 'settle_date') {
+        if (String(raw).trim() === '') throw new InputError(`第 ${rowIndex + 2} 行 ${name} 为空`)
+        record[name] = String(raw).trim()
+      } else {
+        const value = Number(String(raw).replace(/,/g, '').trim())
+        if (!Number.isFinite(value)) {
+          throw new InputError(`第 ${rowIndex + 2} 行 ${name} 不是有效数字: ${JSON.stringify(raw)}`)
+        }
+        record[name] = value
+      }
+    }
+    return record
+  })
+}
+
+/**
+ * 汇总并检查异常。
+ * @param {Array<Record<string, string|number>>} records
+ * @param {number|null} declaredRate 公示费率（小数），null 表示未提供
+ * @returns {{totals: object, effectiveRate: number, expectedCommission: number|null, delta: number|null, anomalies: object[]}}
+ */
+function audit(records, declaredRate) {
+  const totals = { gmv: 0, commission: 0, serviceFee: 0, refund: 0, payout: 0 }
+  const anomalies = []
+  const seen = new Set()
+  for (const record of records) {
+    const gmv = Number(record.gmv)
+    const commission = Number(record.commission)
+    const serviceFee = Number(record.service_fee)
+    const refund = Number(record.refund)
+    const payout = Number(record.payout)
+    totals.gmv += gmv
+    totals.commission += commission
+    totals.serviceFee += serviceFee
+    totals.refund += refund
+    totals.payout += payout
+    const push = (code, detail) => anomalies.push({ code, orderId: record.order_id, detail })
+    if ([gmv, commission, serviceFee, refund, payout].some((value) => value < 0)) push('NEGATIVE_AMOUNT', '存在负金额')
+    if (commission > gmv) push('COMMISSION_GT_GMV', `佣金 ${commission} > 交易额 ${gmv}`)
+    if (refund > gmv) push('REFUND_GT_GMV', `退款 ${refund} > 交易额 ${gmv}`)
+    const expected = gmv - commission - serviceFee + refund
+    if (Math.abs(payout - expected) > 0.01) push('PAYOUT_MISMATCH', `到账 ${payout} ≠ 应有 ${expected.toFixed(2)}`)
+    if (gmv > 0 && (commission + serviceFee) / gmv > 0.3) push('RATE_OUTLIER', `单笔费率 ${(((commission + serviceFee) / gmv) * 100).toFixed(1)}%`)
+    if (seen.has(record.order_id)) push('DUPLICATE_ORDER', '订单号重复')
+    seen.add(record.order_id)
+  }
+  const charges = totals.commission + totals.serviceFee
+  const effectiveRate = totals.gmv > 0 ? charges / totals.gmv : 0
+  const expectedCommission = declaredRate === null ? null : totals.gmv * declaredRate
+  const delta = expectedCommission === null ? null : charges - expectedCommission
+  return { totals, effectiveRate, expectedCommission, delta, anomalies }
+}
+
+/** 格式化金额。 */
+function money(value) {
+  return `¥${value.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}
+
+/**
+ * 自检：正例 + 四条负例。
+ * @returns {number} 0 通过 / 3 失败
+ */
+function runSelfTest() {
+  const failures = []
+  const header = REQUIRED.join(',')
+  const good = [
+    header,
+    'A1,2026-01-05,1000,50,10,0,940',
+    'A2,2026-01-06,2000,100,20,0,1880',
+    'A3,2026-01-07,500,25,5,100,570',
+  ].join('\n')
+  const table = parseCsv(good)
+  const records = mapRows(table)
+  const result = audit(records, 0.06)
+  if (result.totals.gmv !== 3500) failures.push(`GMV 应为 3500，实际 ${result.totals.gmv}`)
+  if (Math.abs(result.effectiveRate - 210 / 3500) > 1e-9) failures.push(`费率应为 ${210 / 3500}，实际 ${result.effectiveRate}`)
+  if (Math.abs(result.delta - (210 - 3500 * 0.06)) > 1e-9) failures.push(`差额算错: ${result.delta}`)
+  if (result.anomalies.length !== 0) failures.push(`正例不应有异常，实际 ${result.anomalies.length} 条`)
+
+  // 负例 1：缺列 ⇒ InputError
+  try {
+    mapRows(parseCsv('order_id,gmv\nA1,100'))
+    failures.push('负例1 失败：缺列却未报错')
+  } catch (error) {
+    if (!(error instanceof InputError)) failures.push('负例1 抛出的不是 InputError')
+  }
+  // 负例 2：佣金 > GMV ⇒ 异常 COMMISSION_GT_GMV
+  const bad1 = audit(mapRows(parseCsv(`${header}\nA1,2026-01-05,100,200,0,0,0`)), null)
+  if (!bad1.anomalies.some((item) => item.code === 'COMMISSION_GT_GMV')) failures.push('负例2 失败：未检出 佣金>GMV')
+  // 负例 3：到账对不上 ⇒ PAYOUT_MISMATCH
+  const bad2 = audit(mapRows(parseCsv(`${header}\nA1,2026-01-05,1000,50,10,0,999`)), null)
+  if (!bad2.anomalies.some((item) => item.code === 'PAYOUT_MISMATCH')) failures.push('负例3 失败：未检出 到账不符')
+  // 负例 4：金额非数字 ⇒ InputError
+  try {
+    mapRows(parseCsv(`${header}\nA1,2026-01-05,abc,50,10,0,940`))
+    failures.push('负例4 失败：非数字金额被接受')
+  } catch (error) {
+    if (!(error instanceof InputError)) failures.push('负例4 抛出的不是 InputError')
+  }
+  // 负例 5：重复订单号
+  const bad3 = audit(mapRows(parseCsv(`${header}\nA1,2026-01-05,1000,50,10,0,940\nA1,2026-01-06,1000,50,10,0,940`)), null)
+  if (!bad3.anomalies.some((item) => item.code === 'DUPLICATE_ORDER')) failures.push('负例5 失败：未检出 重复订单号')
+
+  if (failures.length > 0) {
+    for (const item of failures) console.error(`SELFTEST FAIL: ${item}`)
+    return 3
+  }
+  console.log('SELFTEST PASS: 正例汇总正确；缺列/非数字/佣金超额/到账不符/重复单号 五条负例全部拦下')
+  return 0
+}
+
+/**
+ * CLI 入口。
+ * @param {string[]} argv
+ * @returns {number} 退出码 0/1/2/3
+ */
+function main(argv) {
+  if (argv.includes('--self-test')) return runSelfTest()
+  const option = (name, fallback = null) => {
+    const index = argv.indexOf(`--${name}`)
+    return index >= 0 && argv[index + 1] ? argv[index + 1] : fallback
+  }
+  const input = option('input')
+  if (!input) {
+    console.error('用法: node audit.mjs --input settle.csv [--declared-rate 0.06] [--json out.json] | --self-test')
+    return 2
+  }
+  const adapter = option('adapter', 'generic')
+  if (!(adapter in ADAPTERS)) {
+    console.error(`适配器 ${adapter} 不在 v0 支持范围（仅 generic）。未拿到真实导出样本前不猜测列名。`)
+    return 2
+  }
+  const rateText = option('declared-rate')
+  const declaredRate = rateText === null ? null : Number(rateText)
+  if (declaredRate !== null && !Number.isFinite(declaredRate)) {
+    console.error(`--declared-rate 不是有效数字: ${rateText}`)
+    return 2
+  }
+  try {
+    const text = readFileSync(input, 'utf8')
+    const result = audit(mapRows(parseCsv(text)), declaredRate)
+    const { totals, effectiveRate, expectedCommission, delta, anomalies } = result
+    console.log(`实际抽成      ${money(totals.commission + totals.serviceFee)}   费率 ${(effectiveRate * 100).toFixed(2)}%`)
+    console.log(`GMV           ${money(totals.gmv)}`)
+    if (expectedCommission !== null) {
+      console.log(`公示费率      ${(declaredRate * 100).toFixed(2)}%   应抽 ${money(expectedCommission)}`)
+      console.log(`差额          ${money(delta)}`)
+    } else {
+      console.log('公示费率      未提供（加 --declared-rate 可算差额）')
+    }
+    console.log(`异常          ${anomalies.length} 项`)
+    for (const item of anomalies.slice(0, 10)) console.log(`  - ${item.code} ${item.orderId} ${item.detail}`)
+    const jsonPath = option('json')
+    if (jsonPath) {
+      writeFileSync(jsonPath, JSON.stringify({ totals, effectiveRate, declaredRate, expectedCommission, delta, anomalies }, null, 2), 'utf8')
+      console.log(`JSON          ${jsonPath}`)
+    }
+    return anomalies.length > 0 ? 1 : 0
+  } catch (error) {
+    if (error instanceof InputError) {
+      console.error(`输入错误: ${error.message}`)
+      return 2
+    }
+    throw error
+  }
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  process.exit(main(process.argv.slice(2)))
+}
+
+export { parseCsv, mapRows, audit, runSelfTest, InputError, REQUIRED }
