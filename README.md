@@ -60,11 +60,14 @@ node audit.mjs --input 你的结算单.csv --mapping map.json --declared-rate 0.
 
 ## 输入格式
 
-CSV（UTF-8，可带 BOM），必需列：
+**CSV（UTF-8，可带 BOM）或 .xlsx 均可直接读**，必需列：
 
 `order_id, settle_date, gmv, commission, service_fee, refund, payout`
 
-含义见 [spec.md](spec.md)。XLSX 请先另存为 CSV。
+含义见 [spec.md](spec.md)。
+
+`.xlsx` 由零依赖的内置读取器解析（只用 Node 自带 zlib，不装任何包）。
+Excel 里的日期是序列号，会自动换算成 `YYYY-MM-DD`。
 
 ## 退出码
 
