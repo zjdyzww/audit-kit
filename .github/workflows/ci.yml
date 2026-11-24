@@ -25,6 +25,18 @@ jobs:
           set -e
           echo "exit=$code"
           test "$code" -eq 1
+      - name: 真实 xlsx 必须可读（openpyxl 生成，跨实现验证）
+        run: |
+          node audit.mjs --input examples/示例-结算单.xlsx --emit-mapping > map.json
+          node audit.mjs --input examples/示例-结算单.xlsx --mapping map.json --declared-rate 0.06
+      - name: 坏 xlsx 必须返回 2
+        run: |
+          printf 'not a zip' > bad.xlsx
+          set +e
+          node audit.mjs --input bad.xlsx --mapping map.json
+          code=$?
+          set -e
+          test "$code" -eq 2
       - name: 缺列必须返回 2 且不出报告
         run: |
           printf 'order_id,gmv\nA1,100\n' > broken.csv
